@@ -27,6 +27,7 @@ import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderOrchestrationAdapterInfrastructure from "./ProviderOrchestrationAdapterInfrastructure.ts";
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
+import { DeepAIAccount } from "../deepai/DeepAIAccount.ts";
 import * as ProviderHostLive from "./ProviderHostLive.ts";
 import type * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
@@ -56,6 +57,23 @@ export const deriveProviderInstanceConfigMap = (
   settings: ServerSettings,
 ): ProviderInstanceConfigMap => {
   const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
+
+  {
+    // The managed DeepAI account is a Pi instance the host seeds itself: a user
+    // cannot point it at another driver, disable it, or rename it away.
+    const saved = merged.deepai;
+    const config =
+      saved?.config !== null && typeof saved?.config === "object" && !Array.isArray(saved.config)
+        ? saved.config
+        : {};
+    merged.deepai = {
+      ...saved,
+      driver: ProviderDriverKind.make("pi"),
+      displayName: "DeepAI",
+      enabled: true,
+      config: { ...config, deepai: true, enabled: true },
+    };
+  }
 
   for (const driver of BUILT_IN_DRIVERS) {
     if (driver.metadata.hasDefaultInstance === false) continue;
@@ -87,6 +105,30 @@ export const deriveProviderInstanceConfigMap = (
 };
 
 export const DEV_REPLAY_INSTANCE_ID = ProviderInstanceId.make("devReplay");
+export const DEEPAI_INSTANCE_ID = ProviderInstanceId.make("deepai");
+
+/**
+ * Persists the managed DeepAI instance so it appears in the provider list; the derived
+ * config map then keeps its driver and enabled flags pinned against later edits.
+ * 把托管 DeepAI 实例写入 settings 使其出现在 provider 列表；derive 的 map 会固定其 driver/enabled。
+ */
+export const seedDeepAIInstance = Effect.fn(
+  "ProviderInstanceRegistryHydration.seedDeepAIInstance",
+)(function* () {
+  const serverSettings = yield* Settings.ServerSettingsService;
+  const existing = (yield* serverSettings.getSettings).providerInstances[DEEPAI_INSTANCE_ID];
+  if (existing !== undefined) return;
+  yield* serverSettings.updateProviderInstance({
+    operation: "upsert",
+    instanceId: DEEPAI_INSTANCE_ID,
+    instance: {
+      driver: ProviderDriverKind.make("pi"),
+      displayName: "DeepAI",
+      enabled: true,
+      config: { deepai: true, enabled: true },
+    },
+  });
+});
 
 /**
  * Dev servers run from source keep a free ACP agent that replays recorded turns, so UI checks
@@ -179,6 +221,9 @@ export const layer: Layer.Layer<
     yield* seedDevReplayInstance().pipe(
       Effect.catchCause((cause) => Effect.logWarning("Dev replay agent unavailable", cause)),
     );
+    yield* seedDeepAIInstance().pipe(
+      Effect.catchCause((cause) => Effect.logWarning("DeepAI instance seed unavailable", cause)),
+    );
     // Subscribe before the seed read so saves during registry construction are queued.
     const settingsChanges = yield* serverSettings.subscribeChanges;
     const initialSettings: ServerSettings | undefined = yield* serverSettings.getSettings.pipe(
@@ -204,7 +249,24 @@ export const layer: Layer.Layer<
     }).pipe(
       Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
       Layer.provide(AcpRegistrySupport.layerFromHost),
-      Layer.provide(ProviderHostLive.layer),
+      // Fresh: the shared ProviderHostLive.layer is built elsewhere without the account below.
+      // fresh：共享的 ProviderHostLive.layer 会在别处无 DeepAIAccount 的上下文中被 memoize。
+      Layer.provide(Layer.fresh(ProviderHostLive.layer)),
+      // The host finds this via serviceOption only because it is provided after the host in
+      // this chain; failure degrades to no managed connection, not a dead server.
+      // 账户层必须晚于 host 提供才能被 serviceOption 看到；失败时降级为无托管连接而非服务崩溃。
+      Layer.provide(
+        DeepAIAccount.layer.pipe(
+          Layer.catchCause((cause) =>
+            Layer.unwrap(
+              Effect.logWarning(
+                "DeepAI account layer unavailable; managed DeepAI disabled",
+                cause,
+              ).pipe(Effect.as(Layer.empty)),
+            ),
+          ),
+        ),
+      ),
       Layer.provide(Layer.succeed(HostProcess.Environment, hostEnvironment)),
       Layer.provide(SecretResolver.layer),
     );

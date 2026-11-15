@@ -89,6 +89,12 @@ export const ServerProviderModel = Schema.Struct({
   // application text generation. Absent means supported.
   supportsTextGeneration: Schema.optional(Schema.Boolean),
   capabilities: Schema.NullOr(ModelCapabilities),
+  /** Advertised context window when the provider reports one the model list drops. */
+  contextWindow: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** Hosted-model price per request, as a decimal string ("0" when free). */
+  theosPerRequest: Schema.optional(TrimmedNonEmptyString),
+  /** Hosted-model per-second price by thinking level, decimal strings. */
+  theosPerSecond: Schema.optional(Schema.Record(Schema.String, TrimmedNonEmptyString)),
 });
 export type ServerProviderModel = typeof ServerProviderModel.Type;
 

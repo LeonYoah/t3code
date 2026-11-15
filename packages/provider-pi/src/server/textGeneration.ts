@@ -38,6 +38,16 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* 
   const runPiJson: TextGenerationOperations.Runner = Effect.fn("PiTextGeneration.runPiJson")(
     function* (request) {
       const { operation, cwd, prompt, modelSelection } = request;
+      if (
+        piSettings.deepai &&
+        modelSelection.model !== "default" &&
+        resolvePiModelSlug(modelSelection.model, undefined)?.provider !== "deepai"
+      ) {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Choose a DeepAI hosted model for this connection.",
+        });
+      }
       const thinking = getModelSelectionStringOptionValue(modelSelection, "thinking");
       if (thinking !== undefined && isPiThinkingLevel(thinking)) {
         const output = yield* runPiVersionCommand(piSettings, environment, cwd).pipe(

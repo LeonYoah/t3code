@@ -150,6 +150,7 @@ const settings = {
   binaryPath: "pi",
   launchArgs: "",
   customModels: [],
+  deepai: false,
 } as const;
 
 describe("PiProvider", () => {

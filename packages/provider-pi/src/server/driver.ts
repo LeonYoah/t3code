@@ -1,15 +1,17 @@
 // User-wide ~/.pi/agent state makes continuation identity use default instance grouping.
-import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import { ProviderDriverKind, TextGenerationError, type ServerProvider } from "@t3tools/contracts";
 import { PiSettings } from "../settings.ts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as HttpClient from "effect/http/HttpClient";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import { piUsageReader } from "./usage.ts";
 import { makePiTextGeneration } from "./textGeneration.ts";
 import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "./adapter.ts";
@@ -87,9 +89,9 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
     instanceId,
     displayName,
     accentColor,
-    environment,
+    environment: inputEnvironment,
     enabled,
-    config,
+    config: inputConfig,
   }) {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
@@ -97,6 +99,36 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
     const httpClient = yield* HttpClient.HttpClient;
     const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
     const host = yield* ProviderHost.ProviderHost;
+    let environment = inputEnvironment;
+    let config = inputConfig;
+    const managed =
+      config.deepai && host.managedPiConnection !== undefined
+        ? yield* host.managedPiConnection(instanceId)
+        : undefined;
+    if (config.deepai && !managed) {
+      return yield* new ProviderDriverError({
+        driver: DRIVER_KIND,
+        instanceId,
+        detail: "DeepAI account routing is unavailable on this server.",
+      });
+    }
+    if (managed) {
+      environment = [
+        ...environment,
+        ...Object.entries(managed.environment).map(([name, value]) => ({
+          name,
+          value,
+          sensitive: name === "T3_DEEPAI_TOKEN",
+        })),
+      ];
+      config = { ...config, launchArgs: managed.launchArgs };
+    } else {
+      environment = [
+        ...environment,
+        { name: "T3_DEEPAI_URL", value: "", sensitive: false },
+        { name: "T3_DEEPAI_TOKEN", value: "", sensitive: true },
+      ];
+    }
     const { cwd } = host.paths;
     const processEnv = yield* mergeProviderInstanceEnvironment(environment);
     const continuationIdentity = defaultProviderContinuationIdentity({
@@ -139,10 +171,40 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
           }),
       ),
     );
-    const textGeneration = yield* makePiTextGeneration(effectiveConfig, processEnv);
+    const nativeGeneration = yield* makePiTextGeneration(effectiveConfig, processEnv);
+    // Managed sign-in changes must not abort or race background text generation.
+    const protect =
+      <I, A>(operation: string, task: (input: I) => Effect.Effect<A, TextGenerationError>) =>
+      (input: I) =>
+        managed?.auth.withAccess
+          ? managed.auth.withAccess(task(input)).pipe(
+              Effect.scoped,
+              Effect.mapError(
+                (cause) => new TextGenerationError({ operation, detail: cause.detail }),
+              ),
+            )
+          : task(input);
+    const textGeneration: ProviderTextGeneration = {
+      generateTranscriptionPostProcessing: protect(
+        "generateTranscriptionPostProcessing",
+        nativeGeneration.generateTranscriptionPostProcessing,
+      ),
+      generateCommitMessage: protect(
+        "generateCommitMessage",
+        nativeGeneration.generateCommitMessage,
+      ),
+      generatePrContent: protect("generatePrContent", nativeGeneration.generatePrContent),
+      generateBranchName: protect("generateBranchName", nativeGeneration.generateBranchName),
+      generateThreadTitle: protect("generateThreadTitle", nativeGeneration.generateThreadTitle),
+      generateReviewGuide: protect("generateReviewGuide", nativeGeneration.generateReviewGuide),
+    };
 
+    const decorate = managed
+      ? managed.decorateSnapshot
+      : (snapshot: ServerProvider) => Effect.succeed(snapshot);
     const checkProvider = checkPiProviderStatus(effectiveConfig, processEnv, cwd).pipe(
       Effect.map(stampIdentity),
+      Effect.flatMap(decorate),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
 
@@ -153,7 +215,10 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
       initialSnapshot: (settings) =>
-        buildInitialPiProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
+        buildInitialPiProviderSnapshot(settings.provider).pipe(
+          Effect.map(stampIdentity),
+          Effect.flatMap(decorate),
+        ),
       checkProvider,
       enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
         resolveMaintenance().pipe(
@@ -179,6 +244,18 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
           }),
       ),
     );
+
+    if (managed) {
+      yield* managed.changes.pipe(
+        Stream.runForEach(() =>
+          managed.refresh.pipe(
+            Effect.andThen(snapshot.refresh),
+            Effect.catchCause(() => Effect.void),
+          ),
+        ),
+        Effect.forkScoped,
+      );
+    }
 
     return {
       instanceId,
@@ -214,6 +291,12 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
             ),
       orchestrationAdapter,
       textGeneration,
+      ...(managed
+        ? {
+            auth: managed.auth,
+            refreshModels: () => managed.refresh,
+          }
+        : {}),
     } satisfies ProviderInstance;
   }),
 };

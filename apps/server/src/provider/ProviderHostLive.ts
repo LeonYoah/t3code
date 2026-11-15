@@ -5,11 +5,16 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
+import * as SecureRandom from "effect/crypto/SecureRandom";
+import type { ProviderInstanceId } from "@t3tools/contracts";
 
 import { resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../config.ts";
+import { DeepAIAccount } from "../deepai/DeepAIAccount.ts";
+import { makeDeepAIPiConnection } from "../deepai/DeepAIPiConnection.ts";
 import * as ServerLifecycleEvents from "../serverLifecycleEvents.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as DocumentText from "./DocumentText.ts";
@@ -24,11 +29,26 @@ export const layer = Layer.effect(
     const secrets = yield* ServerSecretStore.ServerSecretStore;
     const digest = yield* Digest.Digest;
     const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* SecureRandom.SecureRandom;
     // Optional so standalone provider layers in tests probe at once.
     const lifecycleEvents = yield* Effect.serviceOption(
       ServerLifecycleEvents.ServerLifecycleEvents,
     );
+    const account = yield* Effect.serviceOption(DeepAIAccount);
     return ProviderHost.ProviderHost.of({
+      ...(Option.isSome(account)
+        ? {
+            managedPiConnection: (instanceId: ProviderInstanceId) =>
+              makeDeepAIPiConnection(instanceId).pipe(
+                Effect.provideService(DeepAIAccount, account.value),
+                Effect.provideService(ServerConfig.ServerConfig, config),
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+                Effect.provideService(SecureRandom.SecureRandom, crypto),
+              ),
+          }
+        : {}),
       paths: {
         cwd: config.cwd,
         baseDir: config.baseDir,
